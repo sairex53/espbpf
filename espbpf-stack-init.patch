@@ -1,0 +1,333 @@
+diff --git a/README.md b/README.md
+index e0d7f26..260d350 100644
+--- a/README.md
++++ b/README.md
+@@ -27,7 +27,7 @@
+ | Гарантия | Как достигается |
+ |---|---|
+ | **завершается** | переходы разрешены только вперёд, граф потока управления ацикличен, число шагов не больше длины программы |
+-| **не читает мусор** | абстрактная интерпретация: тип каждого регистра (не инициализирован / число / указатель на ctx, стек или rodata) отслеживается по всем путям и сливается в точках соединения |
++| **не читает мусор** | абстрактная интерпретация отслеживает инициализацию регистров и каждого байта стека по всем путям; в точках соединения байт считается инициализированным, только если его записали на каждом пути |
+ | **не лезет в чужую память** | разыменовывать можно только указатели, число — никогда; у скаляров и смещений указателей отслеживается диапазон `[lo, hi]`, поэтому `buf[i & 7]` и `if (i < 8) buf[i]` доказываются статически; если диапазон вывести не удалось, границы проверяются в рантайме |
+ | **зовёт только разрешённое** | номер хелпера и типы аргументов сверяются с окружением хука |
+ | **не портит контекст** | ctx хука `sensor` только для чтения |
+@@ -37,8 +37,8 @@
+ ### Чем отличается от верификатора Linux
+ 
+ - **Нет циклов.** В ядре есть bounded loops через перебор состояний, здесь это слишком дорого по памяти. Циклы с константной границей clang разворачивает сам.
+-- **Диапазоны значений проще, чем в ядре.** Есть `[lo, hi]` для скаляров и смещений указателей, сужение на условных переходах, правила для `&`, `%`, сдвигов и ширины загрузки. Нет `var_off` (трекинга отдельных битов) и 32-битных диапазонов отдельно от 64-битных. Границы клампятся до 32 бит: состояние одной точки ветвления занимает 132 байта, всего не больше 33 КиБ (предел 256 точек).
+-- **Если диапазон неизвестен, доступ проверяется в рантайме,** а не отвергается. Ядро в таком случае отказывает.
++- **Диапазоны значений проще, чем в ядре.** Есть `[lo, hi]` для скаляров и смещений указателей, сужение на условных переходах, правила для `&`, `%`, сдвигов и ширины загрузки. Нет `var_off` (трекинга отдельных битов) и 32-битных диапазонов отдельно от 64-битных. Границы клампятся до 32 бит; компактная карта инициализации занимает ещё 64 байта на состояние: при 256 точках ветвления это около 49 КиБ.
++- **Если диапазон неизвестен, границы доступа проверяются в рантайме.** Для чтения из стека верификатор дополнительно требует доказать, что все потенциально читаемые байты инициализированы; иначе программа отклоняется.
+ - **`ptr |= scalar` разрешён.** clang генерирует это для `fp_aligned + small`, а ядро такое отвергает (см. `examples/comfort_leds.c`).
+ - **Нет maps, есть хелперы `map_get`/`map_set`.** Нет вызовов bpf-to-bpf: функции должны быть `static inline`.
+ 
+diff --git a/core/include/espbpf.h b/core/include/espbpf.h
+index 2eff5a4..eb1462b 100644
+--- a/core/include/espbpf.h
++++ b/core/include/espbpf.h
+@@ -8,7 +8,7 @@
+  * portable interpreter. The verifier guarantees that an accepted program:
+  *   - terminates (the control-flow graph is acyclic, so the number of
+  *     executed instructions is bounded by the program length);
+- *   - never reads an uninitialised register;
++ *   - never reads an uninitialised register or stack byte;
+  *   - dereferences only pointers it was given (context, stack, rodata),
+  *     never scalars;
+  *   - calls only helpers registered by the host, with correctly typed
+diff --git a/core/src/verifier.c b/core/src/verifier.c
+index 72defe2..df76b96 100644
+--- a/core/src/verifier.c
++++ b/core/src/verifier.c
+@@ -19,7 +19,9 @@
+  * interpreter's run-time bounds checks. Dereferencing a scalar is always
+  * rejected.
+  *
+- * Memory cost: 44 bytes per jump target plus 2 bytes per instruction.
++ * Memory cost: sizeof(struct vstate) per jump target plus 2 bytes per
++ * instruction. A state also carries a byte-level bitmap of initialised
++ * stack memory so reads are safe across control-flow joins.
+  */
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -85,6 +87,8 @@ static const struct reg R_ANY = { T_SCALAR, 0, RLO, RHI };
+ 
+ struct vstate {
+     struct reg r[11];
++    /* One bit per byte of the 512-byte eBPF stack. */
++    uint8_t stack_init[ESPBPF_STACK_SIZE / 8];
+ };
+ 
+ #define NO_SLOT 0xffff
+@@ -372,6 +376,9 @@ static void merge(struct vstate *into, const struct vstate *from)
+             *a = (struct reg){ T_MIXED, 0, 0, 0 };
+         }
+     }
++    /* A byte is initialised after a join only if every incoming path wrote it. */
++    for (size_t i = 0; i < sizeof(into->stack_init); i++)
++        into->stack_init[i] &= from->stack_init[i];
+ }
+ 
+ static void propagate(struct verifier *v, uint32_t target,
+@@ -454,6 +461,27 @@ static void refine(struct reg *r, uint8_t op, int64_t imm, bool taken)
+     r->hi = (int32_t)clamp64(hi);
+ }
+ 
++static bool stack_range_initialized(const struct vstate *st,
++                                    int64_t lo, int64_t hi)
++{
++    if (lo < -(int64_t)ESPBPF_STACK_SIZE || hi > 0 || lo > hi)
++        return false;
++    for (int64_t off = lo; off < hi; off++) {
++        size_t byte = (size_t)(off + ESPBPF_STACK_SIZE);
++        if (!(st->stack_init[byte / 8] & (uint8_t)(1u << (byte % 8))))
++            return false;
++    }
++    return true;
++}
++
++static void stack_mark_initialized(struct vstate *st, int64_t lo, int64_t hi)
++{
++    for (int64_t off = lo; off < hi; off++) {
++        size_t byte = (size_t)(off + ESPBPF_STACK_SIZE);
++        st->stack_init[byte / 8] |= (uint8_t)(1u << (byte % 8));
++    }
++}
++
+ static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st,
+                         unsigned base, int16_t off, unsigned size, bool write)
+ {
+@@ -487,6 +515,13 @@ static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st
+                     base);
+     }
+     if (r_unknown(r)) {
++        /* An unknown stack offset may point at any byte. Do not let a
++         * dynamically bounds-checked load expose bytes not initialised on
++         * every path. */
++        if (r->type == T_PTR_STACK && !write &&
++            !stack_range_initialized(st, -(int64_t)ESPBPF_STACK_SIZE, 0))
++            return fail(v, pc,
++                        "stack read has an unknown offset and may include uninitialised bytes");
+         /* No bound could be derived (e.g. `ptr |= scalar`). The access is
+          * still safe: the interpreter range-checks every load and store. */
+         v->dynamic_checks++;
+@@ -503,10 +538,25 @@ static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st
+                     rtype_name[r->type], (long long)olo, (long long)ohi, size,
+                     (long long)lo, (long long)hi);
+     }
++    if (r->type == T_PTR_STACK && !write &&
++        !stack_range_initialized(st, olo, ohi + (int64_t)size))
++        return fail(v, pc, "stack read includes an uninitialised byte");
+     v->static_checks++;     /* proven in the verifier, no run-time check needed */
+     return ESPBPF_OK;
+ }
+ 
++static void mark_stack_store(struct vstate *st, unsigned base, int16_t off,
++                             unsigned size)
++{
++    const struct reg *r = &st->r[base];
++    /* A variable-offset store writes only one of its possible locations, so
++     * marking the whole abstract range would be unsound. */
++    if (r->type == T_PTR_STACK && !r_unknown(r) && r->lo == r->hi) {
++        int64_t lo = (int64_t)r->lo + off;
++        stack_mark_initialized(st, lo, lo + size);
++    }
++}
++
+ /* Range transfer function for arithmetic on scalars. Returns the new
+  * register state; anything not modelled becomes an unbounded scalar. */
+ static struct reg alu_range(uint8_t op, bool is64, bool x, const struct reg *d,
+@@ -689,6 +739,54 @@ static int step_call(struct verifier *v, uint32_t pc, struct vstate *st,
+             break;
+         }
+     }
++    for (unsigned i = 0; i < 5; i++) {
++        if (h->args[i] != ESPBPF_ARG_PTR_MEM)
++            continue;
++        if (i + 1 >= 5 || h->args[i + 1] != ESPBPF_ARG_SIZE)
++            return fail(v, pc, "%s: pointer argument has no size contract", h->name);
++        unsigned ptr_reg = i + 1;
++        unsigned size_reg = i + 2;
++        const struct reg *ptr = &st->r[ptr_reg];
++        const struct reg *len = &st->r[size_reg];
++        if (ptr->type != T_PTR_STACK)
++            continue;
++
++        /* Negative sizes become huge unsigned lengths and are rejected by
++         * the helper's bounds check. A zero length reads no stack bytes. */
++        if (!r_unknown(len) && len->hi <= 0)
++            continue;
++
++        int64_t lo, hi;
++        if (r_unknown(ptr) || r_unknown(len)) {
++            lo = -(int64_t)ESPBPF_STACK_SIZE;
++            hi = 0;
++        } else {
++            int64_t ptr_lo = ptr->lo;
++            int64_t ptr_hi = ptr->hi;
++            int64_t min_len = len->lo > 0 ? len->lo : 0;
++            int64_t max_len = len->hi;
++            if (ptr_lo < -(int64_t)ESPBPF_STACK_SIZE)
++                ptr_lo = -(int64_t)ESPBPF_STACK_SIZE;
++            if (ptr_hi > 0)
++                ptr_hi = 0;
++            /* The helper rejects an out-of-bounds (pointer, length) pair
++             * before reading. If even the smallest non-negative length
++             * cannot fit, this call cannot read any stack bytes. */
++            if (ptr_lo > ptr_hi || ptr_lo + min_len > 0)
++                continue;
++            lo = ptr_lo;
++            hi = ptr_hi + max_len;
++            if (lo < -(int64_t)ESPBPF_STACK_SIZE)
++                lo = -(int64_t)ESPBPF_STACK_SIZE;
++            if (hi > 0)
++                hi = 0;
++            if (hi < -(int64_t)ESPBPF_STACK_SIZE || lo >= hi)
++                continue;   /* no in-bounds stack byte can be read */
++        }
++        if (!stack_range_initialized(st, lo, hi))
++            return fail(v, pc,
++                        "%s: helper may read an uninitialised stack byte", h->name);
++    }
+     for (unsigned r = 1; r <= 5; r++)
+         st->r[r] = (struct reg){ T_UNINIT, 0, 0, 0 };
+     st->r[0] = R_ANY;
+@@ -755,12 +853,18 @@ static int pass2(struct verifier *v)
+         case BPF_ST:
+             rc = check_access(v, pc, &st, in->dst, in->off,
+                               bpf_size_bytes(in->code), true);
++            if (!rc)
++                mark_stack_store(&st, in->dst, in->off,
++                                 bpf_size_bytes(in->code));
+             break;
+ 
+         case BPF_STX:
+             if (!(rc = need_value(v, pc, &st, in->src)))
+                 rc = check_access(v, pc, &st, in->dst, in->off,
+                                   bpf_size_bytes(in->code), true);
++            if (!rc)
++                mark_stack_store(&st, in->dst, in->off,
++                                 bpf_size_bytes(in->code));
+             break;
+ 
+         default: /* JMP, JMP32 */
+diff --git a/tests/test_vm.c b/tests/test_vm.c
+index 3e52a1f..9a475ca 100644
+--- a/tests/test_vm.c
++++ b/tests/test_vm.c
+@@ -265,6 +265,40 @@ int main(void)
+         struct espbpf_insn c[] = { EXIT() };
+         expect_reject("uninit r0", c, N(c), &env, "r0 is not initialised");
+     }
++    {
++        struct espbpf_insn c[] = { LDX(BPF_B, 0, 10, -1), EXIT() };
++        expect_reject("uninit stack byte", c, N(c), &env, "uninitialised byte");
++    }
++    {
++        /* Initialising one byte does not make the rest of a wider load safe. */
++        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -8, 1),
++                                   LDX(BPF_DW, 0, 10, -8), EXIT() };
++        expect_reject("partially initialised stack load", c, N(c), &env,
++                      "uninitialised byte");
++    }
++    {
++        /* The store occurs on only one incoming path to the load. */
++        struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 1),
++                                   ST_IMM(BPF_B, 10, -1, 9),
++                                   LDX(BPF_B, 0, 10, -1), EXIT() };
++        expect_reject("stack init merged across paths", c, N(c), &env,
++                      "uninitialised byte");
++    }
++    {
++        /* A byte written on both incoming paths remains initialised at join. */
++        struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 2),
++                                   ST_IMM(BPF_B, 10, -1, 1), JA(1),
++                                   ST_IMM(BPF_B, 10, -1, 2),
++                                   LDX(BPF_B, 0, 10, -1), EXIT() };
++        expect_ret("stack init on both paths", c, N(c), 1);
++    }
++    {
++        /* A helper with a pointer+length contract also reads stack memory. */
++        struct espbpf_insn c[] = { MOV64_REG(1, 10), ALU64_IMM(BPF_ADD, 1, -8),
++                                   MOV64_IMM(2, 1), CALL(2), EXIT() };
++        expect_reject("helper reads uninitialised stack", c, N(c), &env,
++                      "uninitialised stack byte");
++    }
+     {
+         struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 1),
+                                    MOV64_IMM(0, 1), EXIT() };
+@@ -299,7 +333,8 @@ int main(void)
+         expect_reject("scalar deref", c, N(c), &env, "scalar");
+     }
+     {
+-        struct espbpf_insn c[] = { LDX(BPF_DW, 2, 10, -8), LDX(BPF_W, 0, 2, 0), EXIT() };
++        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
++                                   LDX(BPF_DW, 2, 10, -8), LDX(BPF_W, 0, 2, 0), EXIT() };
+         expect_reject("pointer from memory", c, N(c), &env, "scalar");
+     }
+     {
+@@ -370,7 +405,8 @@ int main(void)
+ 
+     {
+         /* i = ctx->a & 7; *(fp - 8 + i) : provable, no run-time check */
+-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_AND, 3, 7),
++        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
++                                   LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_AND, 3, 7),
+                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
+                                    ALU64_REG(BPF_ADD, 2, 3), ST_IMM(BPF_B, 2, 0, 5),
+                                    LDX(BPF_B, 0, 10, -1), EXIT() };
+@@ -385,7 +421,8 @@ int main(void)
+     }
+     {
+         /* if (i <= 7) { *(fp - 8 + i) } : the compare bounds i */
+-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), MOV64_IMM(0, 0),
++        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
++                                   LDX(BPF_B, 3, 1, 0), MOV64_IMM(0, 0),
+                                    JMP_IMM(BPF_JGT, 3, 7, 4),
+                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
+                                    ALU64_REG(BPF_ADD, 2, 3), LDX(BPF_B, 0, 2, 0),
+@@ -401,7 +438,8 @@ int main(void)
+     }
+     {
+         /* n % 8 is 0..7 */
+-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MOD, 3, 8),
++        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
++                                   LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MOD, 3, 8),
+                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
+                                    ALU64_REG(BPF_ADD, 2, 3), ST_IMM(BPF_B, 2, 0, 9),
+                                    LDX(BPF_B, 0, 10, -1), EXIT() };
+@@ -410,7 +448,8 @@ int main(void)
+     /* ---------------- run-time bounds (unknown offsets) ---------------- */
+     {
+         /* clang idiom: ptr |= small scalar (see comfort_leds.c) */
+-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 4), ALU64_IMM(BPF_AND, 3, 3),
++        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -7, 0),
++                                   LDX(BPF_W, 3, 1, 4), ALU64_IMM(BPF_AND, 3, 3),
+                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
+                                    ALU64_REG(BPF_OR, 2, 3), ST_IMM(BPF_B, 2, 0, 77),
+                                    LDX(BPF_B, 0, 10, -7), EXIT() };
+@@ -424,11 +463,12 @@ int main(void)
+         expect_reject("ptr |= address", c, N(c), &env, "out of bounds");
+     }
+     {
+-        /* r2 = fp + ctx->a*100 (unknown offset); load -> must fault, not read */
++        /* An unknown stack offset cannot be proven initialised, so reject it
++         * before execution rather than relying on a run-time bounds fault. */
+         struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MUL, 3, 100),
+                                    MOV64_REG(2, 10), ALU64_REG(BPF_ADD, 2, 3),
+                                    LDX(BPF_DW, 0, 2, 0), EXIT() };
+-        expect_fault("runtime oob above stack", c, N(c));
++        expect_reject("unknown stack load", c, N(c), &env, "unknown offset");
+     }
+     {
+         struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MUL, 3, 1000),
+@@ -438,7 +478,8 @@ int main(void)
+     }
+     {
+         /* same pattern, in bounds: fp - ctx->a (7) */
+-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), MOV64_REG(2, 10),
++        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -7, 1),
++                                   LDX(BPF_W, 3, 1, 0), MOV64_REG(2, 10),
+                                    ALU64_REG(BPF_SUB, 2, 3), ST_IMM(BPF_B, 2, 0, 9),
+                                    LDX(BPF_B, 0, 10, -7), EXIT() };
+         expect_ret("runtime in-bounds index", c, N(c), 9);
